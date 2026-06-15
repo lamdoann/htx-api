@@ -1,0 +1,45 @@
+{
+  "name": "htx-api",
+  "version": "0.1.0",
+  "description": "Unofficial Node.js/TypeScript SDK for the HTX (Huobi) Spot REST & WebSocket API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "lint": "tsc --noEmit",
+    "example:rest": "ts-node examples/rest-exchange-info.ts",
+    "example:ws": "ts-node examples/ws-trades.ts"
+  },
+  "keywords": [
+    "htx",
+    "huobi",
+    "api",
+    "crypto",
+    "exchange",
+    "spot",
+    "websocket",
+    "trade",
+    "typescript"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "rimraf": "^5.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
