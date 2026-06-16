@@ -15,7 +15,9 @@
     "prepublishOnly": "npm run clean && npm run build",
     "lint": "tsc --noEmit",
     "example:rest": "ts-node examples/rest-exchange-info.ts",
-    "example:ws": "ts-node examples/ws-trades.ts"
+    "example:ws": "ts-node examples/ws-trades.ts",
+    "example:klines": "ts-node examples/ws-klines.ts",
+    "example:orders": "ts-node examples/private-orders.ts"
   },
   "keywords": [
     "htx",

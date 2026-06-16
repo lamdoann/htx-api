@@ -1,18 +1,30 @@
-import { ExchangeInfo, SymbolInfo } from './types/rest';
+import {
+  ExchangeInfo,
+  OrderSource,
+  SubmitOrderParams,
+  SymbolInfo,
+} from './types/rest';
 import { BaseRestClient } from './util/BaseRestClient';
 
 /**
- * HTX (Huobi) Spot public REST client.
+ * HTX (Huobi) Spot REST client.
  *
- * Scope is intentionally limited to the public market-metadata endpoints needed
- * today; the {@link BaseRestClient} base is structured so authenticated/private
- * endpoints can be layered on later, following the binance SDK pattern.
+ * Public market metadata works without credentials; order placement and any
+ * other private endpoints require `apiKey`/`apiSecret` in the constructor
+ * options. Structured after the binance SDK so additional endpoints can be added
+ * incrementally.
  *
  * @example
  * ```ts
- * const client = new RestClient();
+ * const client = new RestClient({ apiKey: '...', apiSecret: '...' });
  * const info = await client.fetchExchangeInfo();
- * console.log(info.symbols.length);
+ * const orderId = await client.submitSpotOrder({
+ *   accountId: 123,
+ *   symbol: 'btcusdt',
+ *   type: 'buy-limit',
+ *   amount: '0.001',
+ *   price: '50000',
+ * });
  * ```
  */
 export class RestClient extends BaseRestClient {
@@ -23,7 +35,7 @@ export class RestClient extends BaseRestClient {
    * {@link ExchangeInfo} object (analogous to binance's `exchangeInfo`).
    */
   async fetchExchangeInfo(): Promise<ExchangeInfo> {
-    const response = await this.get<SymbolInfo[]>(
+    const response = await this.publicGet<SymbolInfo[]>(
       '/v2/settings/common/symbols',
     );
 
@@ -47,5 +59,58 @@ export class RestClient extends BaseRestClient {
   async fetchOnlineSymbols(): Promise<SymbolInfo[]> {
     const { symbols } = await this.fetchExchangeInfo();
     return symbols.filter((s) => s.state === 'online');
+  }
+
+  /**
+   * Place a spot order via `POST /v1/order/orders/place`.
+   *
+   * Requires credentials. Returns the new order id.
+   */
+  async submitSpotOrder(params: SubmitOrderParams): Promise<string> {
+    return this.placeOrder(params, 'spot-api');
+  }
+
+  /**
+   * Place a margin order via `POST /v1/order/orders/place`.
+   *
+   * Defaults `source` to `margin-api` (isolated margin); pass
+   * `source: 'super-margin-api'` for cross margin. Requires credentials.
+   */
+  async submitMarginOrder(params: SubmitOrderParams): Promise<string> {
+    return this.placeOrder(params, 'margin-api');
+  }
+
+  // --- internals ----------------------------------------------------------
+
+  private async placeOrder(
+    params: SubmitOrderParams,
+    defaultSource: OrderSource,
+  ): Promise<string> {
+    const body: Record<string, unknown> = {
+      'account-id': String(params.accountId),
+      symbol: params.symbol,
+      type: params.type,
+      amount: String(params.amount),
+      source: params.source ?? defaultSource,
+    };
+
+    if (params.price !== undefined) {
+      body.price = String(params.price);
+    }
+    if (params.stopPrice !== undefined) {
+      body['stop-price'] = String(params.stopPrice);
+    }
+    if (params.operator !== undefined) {
+      body.operator = params.operator;
+    }
+    if (params.clientOrderId !== undefined) {
+      body['client-order-id'] = params.clientOrderId;
+    }
+
+    const response = await this.privatePost<string>(
+      '/v1/order/orders/place',
+      body,
+    );
+    return response.data;
   }
 }

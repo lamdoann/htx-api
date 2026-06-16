@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 
 import { HtxRestResponse, RestClientOptions } from '../types/shared';
+import { buildSignedRestParams } from './auth';
 import { DefaultLogger, Logger } from './logger';
 
 export const DEFAULT_REST_BASE_URL = 'https://api.huobi.pro';
@@ -21,19 +22,27 @@ export class HtxApiError extends Error {
 }
 
 /**
- * Thin wrapper around axios that handles the common HTX response envelope.
+ * Thin wrapper around axios that handles HTX request signing and the common
+ * response envelope.
  *
  * Concrete clients (e.g. {@link RestClient}) extend this and expose typed
- * endpoint methods. Only public GET endpoints are needed for the current scope,
- * so request signing is intentionally omitted.
+ * endpoint methods, while {@link BaseRestClient.publicGet},
+ * {@link BaseRestClient.privateGet} and {@link BaseRestClient.privatePost}
+ * remain available for calling any endpoint directly.
  */
 export abstract class BaseRestClient {
   protected readonly baseUrl: string;
+  protected readonly host: string;
   protected readonly logger: Logger;
+  private readonly apiKey?: string;
+  private readonly apiSecret?: string;
   private readonly axiosInstance: AxiosInstance;
 
   constructor(options: RestClientOptions = {}, logger: Logger = DefaultLogger) {
     this.baseUrl = options.baseUrl ?? DEFAULT_REST_BASE_URL;
+    this.host = new URL(this.baseUrl).host;
+    this.apiKey = options.apiKey;
+    this.apiSecret = options.apiSecret;
     this.logger = logger;
     this.axiosInstance = axios.create({
       baseURL: this.baseUrl,
@@ -46,19 +55,76 @@ export abstract class BaseRestClient {
   }
 
   /**
-   * Perform a public GET request and unwrap the HTX response envelope.
+   * Call a public GET endpoint and unwrap the HTX response envelope.
    * @throws {HtxApiError} when the server reports `status: "error"`.
    */
-  protected async get<TData>(
+  async publicGet<TData>(
     endpoint: string,
     params?: Record<string, unknown>,
   ): Promise<HtxRestResponse<TData>> {
-    const config: AxiosRequestConfig = { params };
+    return this.request<TData>({ method: 'GET', endpoint, params });
+  }
 
-    this.logger.debug(`GET ${endpoint}`, params);
-
-    const { data } = await this.axiosInstance.get<HtxRestResponse<TData>>(
+  /**
+   * Call a signed (private) GET endpoint. `params` are signed and sent as the
+   * query string.
+   * @throws {HtxApiError} when the server reports `status: "error"`.
+   */
+  async privateGet<TData>(
+    endpoint: string,
+    params?: Record<string, unknown>,
+  ): Promise<HtxRestResponse<TData>> {
+    return this.request<TData>({
+      method: 'GET',
       endpoint,
+      params,
+      signed: true,
+    });
+  }
+
+  /**
+   * Call a signed (private) POST endpoint. The auth params are signed into the
+   * query string; `body` is sent as the JSON request body.
+   * @throws {HtxApiError} when the server reports `status: "error"`.
+   */
+  async privatePost<TData>(
+    endpoint: string,
+    body?: Record<string, unknown>,
+    params?: Record<string, unknown>,
+  ): Promise<HtxRestResponse<TData>> {
+    return this.request<TData>({
+      method: 'POST',
+      endpoint,
+      params,
+      body,
+      signed: true,
+    });
+  }
+
+  // --- internals ----------------------------------------------------------
+
+  private async request<TData>(args: {
+    method: 'GET' | 'POST';
+    endpoint: string;
+    params?: Record<string, unknown>;
+    body?: Record<string, unknown>;
+    signed?: boolean;
+  }): Promise<HtxRestResponse<TData>> {
+    const { method, endpoint, params, body, signed } = args;
+
+    let queryParams = params;
+    if (signed) {
+      queryParams = this.buildSignedQuery(method, endpoint, params);
+    }
+
+    const config: AxiosRequestConfig = { method, url: endpoint, params: queryParams };
+    if (body !== undefined) {
+      config.data = body;
+    }
+
+    this.logger.debug(`${method} ${endpoint}`, { params, signed: !!signed });
+
+    const { data } = await this.axiosInstance.request<HtxRestResponse<TData>>(
       config,
     );
 
@@ -71,5 +137,27 @@ export abstract class BaseRestClient {
     }
 
     return data;
+  }
+
+  private buildSignedQuery(
+    method: 'GET' | 'POST',
+    endpoint: string,
+    params?: Record<string, unknown>,
+  ): Record<string, string> {
+    if (!this.apiKey || !this.apiSecret) {
+      throw new Error(
+        'apiKey and apiSecret are required for private endpoints. Pass them to the client constructor.',
+      );
+    }
+
+    return buildSignedRestParams({
+      method,
+      host: this.host,
+      path: endpoint,
+      apiKey: this.apiKey,
+      apiSecret: this.apiSecret,
+      // POST bodies are not signed; only auth params (+ explicit query) are.
+      query: method === 'GET' ? params : undefined,
+    });
   }
 }

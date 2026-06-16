@@ -1,20 +1,34 @@
 import { EventEmitter } from 'events';
-import { gunzipSync } from 'zlib';
-import WebSocket, { RawData } from 'ws';
 
 import {
+  KlineInterval,
+  KlineMessage,
+  OrderUpdateMessage,
   SubscriptionResponse,
   TradeDetailMessage,
   WebsocketClientEvents,
   WebsocketClientOptions,
 } from './types/websocket';
+import { buildWsAuthParams } from './util/auth';
 import { DefaultLogger, Logger } from './util/logger';
+import { WsConnection } from './util/WsConnection';
 
 export const DEFAULT_WS_URL = 'wss://api.huobi.pro/ws';
+export const DEFAULT_ACCOUNT_WS_URL = 'wss://api.huobi.pro/ws/v2';
 
-/** Build the trade-detail topic string for a symbol, e.g. `market.btcusdt.trade.detail`. */
+/** Build the trade-detail topic for a symbol, e.g. `market.btcusdt.trade.detail`. */
 export function tradeTopic(symbol: string): string {
   return `market.${symbol.toLowerCase()}.trade.detail`;
+}
+
+/** Build the kline topic for a symbol, e.g. `market.btcusdt.kline.1min`. */
+export function klineTopic(symbol: string, interval: KlineInterval): string {
+  return `market.${symbol.toLowerCase()}.kline.${interval}`;
+}
+
+/** Build the private order channel, e.g. `orders#btcusdt` (or `orders#*`). */
+export function ordersChannel(symbol: string): string {
+  return `orders#${symbol.toLowerCase()}`;
 }
 
 // Strongly-typed EventEmitter surface.
@@ -38,192 +52,300 @@ export interface WebsocketClient {
 }
 
 /**
- * HTX (Huobi) Spot market-data WebSocket client, focused on trade streams.
+ * HTX (Huobi) Spot WebSocket client.
  *
- * Handles the three protocol quirks of the HTX `/ws` market endpoint:
- *  1. inbound frames are GZIP-compressed and must be inflated,
- *  2. the server sends `{"ping": <n>}` heartbeats that must be answered with
- *     `{"pong": <n>}`,
- *  3. subscriptions use `{"sub": "<topic>", "id": "<id>"}`.
+ * Manages two underlying sockets, created lazily as needed:
+ *  - **market** (`wss://api.huobi.pro/ws`) — public trade & kline streams.
+ *    Frames are GZIP-compressed; heartbeat is `{"ping":n}` → `{"pong":n}`.
+ *  - **account** (`wss://api.huobi.pro/ws/v2`) — private order updates. Frames
+ *    are plain JSON; heartbeat is `{"action":"ping"}` → `{"action":"pong"}`;
+ *    requires API key/secret auth before subscribing.
+ *
+ * Subscriptions are remembered and replayed on reconnect.
  *
  * @example
  * ```ts
- * const ws = new WebsocketClient();
- * ws.on('trade', (msg) => console.log(msg.tick.data));
- * ws.connect();
+ * const ws = new WebsocketClient({ apiKey: '...', apiSecret: '...' });
+ * ws.on('trade', (m) => console.log(m.tick.data));
+ * ws.on('order', (m) => console.log(m.data));
  * ws.subscribeTrades('btcusdt');
+ * ws.subscribeKlines('btcusdt', '1min');
+ * ws.subscribeOrders('btcusdt');
  * ```
  */
 export class WebsocketClient extends EventEmitter {
-  private readonly wsUrl: string;
-  private readonly reconnect: boolean;
-  private readonly reconnectIntervalMs: number;
+  private readonly options: Required<
+    Pick<WebsocketClientOptions, 'wsUrl' | 'accountWsUrl' | 'reconnect' | 'reconnectIntervalMs'>
+  > &
+    Pick<WebsocketClientOptions, 'apiKey' | 'apiSecret'>;
   private readonly logger: Logger;
 
-  private ws: WebSocket | null = null;
-  /** Topics we want subscribed; replayed on reconnect. */
-  private readonly subscriptions = new Set<string>();
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private closedByUser = false;
+  private marketConn: WsConnection | null = null;
+  private accountConn: WsConnection | null = null;
+
+  /** Public market topics we want subscribed; replayed on reconnect. */
+  private readonly marketSubs = new Set<string>();
+  /** Private order channels we want subscribed; replayed after (re)auth. */
+  private readonly orderSubs = new Set<string>();
+  private accountAuthenticated = false;
 
   constructor(
     options: WebsocketClientOptions = {},
     logger: Logger = DefaultLogger,
   ) {
     super();
-    this.wsUrl = options.wsUrl ?? DEFAULT_WS_URL;
-    this.reconnect = options.reconnect ?? true;
-    this.reconnectIntervalMs = options.reconnectIntervalMs ?? 2_000;
+    this.options = {
+      apiKey: options.apiKey,
+      apiSecret: options.apiSecret,
+      wsUrl: options.wsUrl ?? DEFAULT_WS_URL,
+      accountWsUrl: options.accountWsUrl ?? DEFAULT_ACCOUNT_WS_URL,
+      reconnect: options.reconnect ?? true,
+      reconnectIntervalMs: options.reconnectIntervalMs ?? 2_000,
+    };
     this.logger = logger;
   }
 
-  /** Open the WebSocket connection. */
+  /** Open the public market connection (private connection opens on demand). */
   connect(): void {
-    if (
-      this.ws &&
-      (this.ws.readyState === WebSocket.OPEN ||
-        this.ws.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
-
-    this.closedByUser = false;
-    this.logger.info(`Connecting to ${this.wsUrl}`);
-
-    const ws = new WebSocket(this.wsUrl);
-    this.ws = ws;
-
-    ws.on('open', () => this.onOpen());
-    ws.on('message', (data) => this.onMessage(data));
-    ws.on('error', (err) => this.emit('error', err));
-    ws.on('close', () => this.onClose());
+    this.ensureMarket().connect();
   }
+
+  // --- public market subscriptions ----------------------------------------
 
   /** Subscribe to the trade-detail stream for one or more symbols. */
   subscribeTrades(symbols: string | string[]): void {
-    const list = Array.isArray(symbols) ? symbols : [symbols];
-    for (const symbol of list) {
-      const topic = tradeTopic(symbol);
-      this.subscriptions.add(topic);
-      this.sendSub(topic);
-    }
+    this.subscribeMarket(toList(symbols).map(tradeTopic));
   }
 
   /** Unsubscribe from the trade-detail stream for one or more symbols. */
   unsubscribeTrades(symbols: string | string[]): void {
-    const list = Array.isArray(symbols) ? symbols : [symbols];
-    for (const symbol of list) {
-      const topic = tradeTopic(symbol);
-      this.subscriptions.delete(topic);
-      this.send({ unsub: topic, id: topic });
+    this.unsubscribeMarket(toList(symbols).map(tradeTopic));
+  }
+
+  /** Subscribe to the kline stream for one or more symbols at a given interval. */
+  subscribeKlines(symbols: string | string[], interval: KlineInterval): void {
+    this.subscribeMarket(toList(symbols).map((s) => klineTopic(s, interval)));
+  }
+
+  /** Unsubscribe from the kline stream for one or more symbols. */
+  unsubscribeKlines(symbols: string | string[], interval: KlineInterval): void {
+    this.unsubscribeMarket(toList(symbols).map((s) => klineTopic(s, interval)));
+  }
+
+  // --- private order subscriptions ----------------------------------------
+
+  /**
+   * Subscribe to private order updates. Pass one or more symbols, or omit to
+   * subscribe to all symbols (`orders#*`). Requires API credentials; the account
+   * connection is opened and authenticated automatically.
+   */
+  subscribeOrders(symbols?: string | string[]): void {
+    const list = symbols === undefined ? ['*'] : toList(symbols);
+    for (const channel of list.map(ordersChannel)) {
+      this.orderSubs.add(channel);
+      if (this.accountAuthenticated) {
+        this.accountConn?.send({ action: 'sub', ch: channel });
+      }
+    }
+    this.ensureAccount().connect();
+  }
+
+  /** Unsubscribe from private order updates. */
+  unsubscribeOrders(symbols?: string | string[]): void {
+    const list = symbols === undefined ? ['*'] : toList(symbols);
+    for (const channel of list.map(ordersChannel)) {
+      this.orderSubs.delete(channel);
+      this.accountConn?.send({ action: 'unsub', ch: channel });
     }
   }
 
-  /** Close the connection and stop reconnecting. */
+  // --- lifecycle ----------------------------------------------------------
+
+  /** Gracefully close all connections and stop reconnecting. */
   close(): void {
-    this.closedByUser = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.ws?.close();
-    this.ws = null;
+    this.marketConn?.close();
+    this.accountConn?.close();
+    this.accountAuthenticated = false;
+  }
+
+  /** Forcefully terminate all connections immediately and stop reconnecting. */
+  terminate(): void {
+    this.marketConn?.terminate();
+    this.accountConn?.terminate();
+    this.accountAuthenticated = false;
   }
 
   // --- internals ----------------------------------------------------------
 
-  private onOpen(): void {
-    this.logger.info('WebSocket connected');
-    this.emit('open');
-    // Replay any topics requested before/across (re)connects.
-    for (const topic of this.subscriptions) {
-      this.sendSub(topic);
+  private subscribeMarket(topics: string[]): void {
+    const conn = this.ensureMarket();
+    for (const topic of topics) {
+      this.marketSubs.add(topic);
+      conn.send({ sub: topic, id: topic });
+    }
+    conn.connect();
+  }
+
+  private unsubscribeMarket(topics: string[]): void {
+    for (const topic of topics) {
+      this.marketSubs.delete(topic);
+      this.marketConn?.send({ unsub: topic, id: topic });
     }
   }
 
-  private onClose(): void {
-    this.logger.info('WebSocket closed');
-    this.emit('close');
-    if (this.reconnect && !this.closedByUser) {
-      this.scheduleReconnect();
+  private ensureMarket(): WsConnection {
+    if (!this.marketConn) {
+      this.marketConn = new WsConnection({
+        name: 'market',
+        url: this.options.wsUrl,
+        gzip: true,
+        reconnect: this.options.reconnect,
+        reconnectIntervalMs: this.options.reconnectIntervalMs,
+        logger: this.logger,
+        onOpen: () => {
+          this.emit('open');
+          for (const topic of this.marketSubs) {
+            this.marketConn?.send({ sub: topic, id: topic });
+          }
+        },
+        onMessage: (msg) => this.routeMarket(msg),
+        onError: (err) => this.emit('error', err),
+        onClose: () => this.emit('close'),
+        onReconnecting: () => this.emit('reconnecting'),
+      });
+    }
+    return this.marketConn;
+  }
+
+  private ensureAccount(): WsConnection {
+    if (!this.accountConn) {
+      this.accountConn = new WsConnection({
+        name: 'account',
+        url: this.options.accountWsUrl,
+        gzip: false,
+        reconnect: this.options.reconnect,
+        reconnectIntervalMs: this.options.reconnectIntervalMs,
+        logger: this.logger,
+        onOpen: () => this.sendAuth(),
+        onMessage: (msg) => this.routeAccount(msg),
+        onError: (err) => this.emit('error', err),
+        onClose: () => {
+          this.accountAuthenticated = false;
+          this.emit('close');
+        },
+        onReconnecting: () => this.emit('reconnecting'),
+      });
+    }
+    return this.accountConn;
+  }
+
+  private routeMarket(message: unknown): void {
+    this.emit('message', message);
+    if (!isObject(message)) {
+      return;
+    }
+
+    // Heartbeat: { "ping": <number> } -> { "pong": <number> }.
+    if (typeof message.ping === 'number') {
+      this.marketConn?.send({ pong: message.ping });
+      return;
+    }
+
+    if (typeof message.subbed === 'string' || typeof message.unsubbed === 'string') {
+      this.emit('response', message as unknown as SubscriptionResponse);
+      return;
+    }
+
+    const ch = message.ch;
+    if (typeof ch === 'string' && message.tick) {
+      if (ch.endsWith('.trade.detail')) {
+        this.emit('trade', message as unknown as TradeDetailMessage);
+      } else if (ch.includes('.kline.')) {
+        this.emit('kline', message as unknown as KlineMessage);
+      }
     }
   }
 
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer) {
-      return;
-    }
-    this.emit('reconnecting');
-    this.logger.info(`Reconnecting in ${this.reconnectIntervalMs}ms`);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, this.reconnectIntervalMs);
-  }
-
-  private onMessage(raw: RawData): void {
-    let decoded: unknown;
-    try {
-      // HTX market frames are gzip-compressed binary.
-      const buffer = this.toBuffer(raw);
-      const text = gunzipSync(buffer).toString('utf-8');
-      decoded = JSON.parse(text);
-    } catch (err) {
-      this.emit('error', err as Error);
+  private routeAccount(message: unknown): void {
+    this.emit('message', message);
+    if (!isObject(message)) {
       return;
     }
 
-    this.emit('message', decoded);
-    this.routeMessage(decoded);
-  }
+    const action = message.action;
 
-  private routeMessage(message: unknown): void {
-    if (typeof message !== 'object' || message === null) {
-      return;
-    }
-    const msg = message as Record<string, unknown>;
-
-    // Heartbeat: { "ping": <number> } -> reply { "pong": <number> }.
-    if (typeof msg.ping === 'number') {
-      this.send({ pong: msg.ping });
+    // Heartbeat: { action: "ping", data: { ts } } -> { action: "pong", data: { ts } }.
+    if (action === 'ping') {
+      const data = isObject(message.data) ? message.data : {};
+      this.accountConn?.send({ action: 'pong', data });
       return;
     }
 
-    // Subscribe / unsubscribe acknowledgement.
-    if (typeof msg.subbed === 'string' || typeof msg.unsubbed === 'string') {
-      this.emit('response', message as SubscriptionResponse);
+    if (action === 'req' && message.ch === 'auth') {
+      if (message.code === 200) {
+        this.accountAuthenticated = true;
+        this.logger.info('[account] authenticated');
+        this.emit('authenticated');
+        for (const channel of this.orderSubs) {
+          this.accountConn?.send({ action: 'sub', ch: channel });
+        }
+      } else {
+        this.emit(
+          'error',
+          new Error(
+            `WebSocket auth failed (code ${message.code}): ${String(message.message ?? '')}`,
+          ),
+        );
+      }
       return;
     }
 
-    // Data push: { ch: "market.<symbol>.trade.detail", tick: {...} }.
+    if (action === 'sub' || action === 'unsub') {
+      this.emit('response', {
+        status: message.code === 200 ? 'ok' : 'error',
+        subbed: action === 'sub' ? (message.ch as string) : undefined,
+        unsubbed: action === 'unsub' ? (message.ch as string) : undefined,
+        ts: Date.now(),
+        'err-code': message.code === 200 ? undefined : String(message.code),
+        'err-msg': message.code === 200 ? undefined : String(message.message ?? ''),
+      });
+      return;
+    }
+
     if (
-      typeof msg.ch === 'string' &&
-      msg.ch.endsWith('.trade.detail') &&
-      msg.tick
+      action === 'push' &&
+      typeof message.ch === 'string' &&
+      message.ch.startsWith('orders#')
     ) {
-      this.emit('trade', message as TradeDetailMessage);
+      this.emit('order', message as unknown as OrderUpdateMessage);
     }
   }
 
-  private sendSub(topic: string): void {
-    this.send({ sub: topic, id: topic });
-  }
-
-  private send(payload: Record<string, unknown>): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) {
-      this.logger.debug('Socket not open; dropping outbound message', payload);
+  private sendAuth(): void {
+    if (!this.options.apiKey || !this.options.apiSecret) {
+      this.emit(
+        'error',
+        new Error('apiKey and apiSecret are required for private channels.'),
+      );
       return;
     }
-    this.ws.send(JSON.stringify(payload));
-  }
 
-  private toBuffer(raw: RawData): Buffer {
-    if (Buffer.isBuffer(raw)) {
-      return raw;
-    }
-    if (Array.isArray(raw)) {
-      return Buffer.concat(raw);
-    }
-    return Buffer.from(raw as ArrayBuffer);
+    const url = new URL(this.options.accountWsUrl);
+    const params = buildWsAuthParams({
+      host: url.host,
+      path: url.pathname,
+      apiKey: this.options.apiKey,
+      apiSecret: this.options.apiSecret,
+    });
+
+    this.accountConn?.send({ action: 'req', ch: 'auth', params });
   }
+}
+
+function toList(symbols: string | string[]): string[] {
+  return Array.isArray(symbols) ? symbols : [symbols];
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
