@@ -2,8 +2,6 @@
 
 Unofficial Node.js / TypeScript SDK for the [HTX (Huobi) Spot](https://www.htx.com/en-us/opend/newApiPages/) API.
 
-Structure is modelled on [tiagosiebler/binance](https://github.com/tiagosiebler/binance): a typed REST client and an event-driven WebSocket client sharing a small `util/` core.
-
 ## Install
 
 ```bash
