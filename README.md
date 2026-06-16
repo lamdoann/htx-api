@@ -63,15 +63,20 @@ const spotId = await client.submitSpotOrder({
   price: '50000',
 });
 
-// margin defaults to source 'margin-api' (isolated);
-// pass source: 'super-margin-api' for cross margin
-const marginId = await client.submitMarginOrder({
+// margin: second arg selects the account mode (default 'isolated')
+//   'isolated' -> source 'margin-api', 'cross' -> source 'super-margin-api'
+const isolatedId = await client.submitMarginOrder({
   accountId: 456,
   symbol: 'btcusdt',
   type: 'sell-limit',
   amount: '0.001',
   price: '70000',
 });
+
+const crossId = await client.submitMarginOrder(
+  { accountId: 456, symbol: 'btcusdt', type: 'sell-limit', amount: '0.001', price: '70000' },
+  'cross',
+);
 ```
 
 ## WebSocket

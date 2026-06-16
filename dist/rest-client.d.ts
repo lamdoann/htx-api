@@ -1,4 +1,4 @@
-import { ExchangeInfo, SubmitOrderParams, SymbolInfo } from './types/rest';
+import { ExchangeInfo, MarginMode, SubmitOrderParams, SymbolInfo } from './types/rest';
 import { BaseRestClient } from './util/BaseRestClient';
 /**
  * HTX (Huobi) Spot REST client.
@@ -42,10 +42,18 @@ export declare class RestClient extends BaseRestClient {
     /**
      * Place a margin order via `POST /v1/order/orders/place`.
      *
-     * Defaults `source` to `margin-api` (isolated margin); pass
-     * `source: 'super-margin-api'` for cross margin. Requires credentials.
+     * `mode` selects the margin account and is mapped to the HTX `source` field:
+     * `isolated` → `margin-api`, `cross` → `super-margin-api`. Defaults to
+     * `isolated`. An explicit `params.source` still takes precedence. Requires
+     * credentials.
+     *
+     * @example
+     * ```ts
+     * await client.submitMarginOrder({ accountId, symbol: 'btcusdt', type: 'buy-limit', amount: '0.001', price: '50000' });          // isolated
+     * await client.submitMarginOrder({ accountId, symbol: 'btcusdt', type: 'buy-limit', amount: '0.001', price: '50000' }, 'cross'); // cross
+     * ```
      */
-    submitMarginOrder(params: SubmitOrderParams): Promise<string>;
+    submitMarginOrder(params: SubmitOrderParams, mode?: MarginMode): Promise<string>;
     private placeOrder;
 }
 //# sourceMappingURL=rest-client.d.ts.map

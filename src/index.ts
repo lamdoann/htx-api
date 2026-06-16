@@ -32,6 +32,7 @@ export type {
   SymbolState,
   OrderType,
   OrderSource,
+  MarginMode,
   SubmitOrderParams,
 } from './types/rest';
 export type {

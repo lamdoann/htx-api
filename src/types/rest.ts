@@ -102,6 +102,14 @@ export type OrderSource =
   | 'c2c-margin-api';
 
 /**
+ * Margin account mode used by {@link RestClient.submitMarginOrder}.
+ *
+ * - `isolated` → `source: "margin-api"`
+ * - `cross`    → `source: "super-margin-api"`
+ */
+export type MarginMode = 'isolated' | 'cross';
+
+/**
  * Parameters for placing an order (`POST /v1/order/orders/place`).
  *
  * Friendly camelCase fields; {@link RestClient.submitSpotOrder} maps them to the

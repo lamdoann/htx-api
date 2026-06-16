@@ -62,11 +62,20 @@ class RestClient extends BaseRestClient_1.BaseRestClient {
     /**
      * Place a margin order via `POST /v1/order/orders/place`.
      *
-     * Defaults `source` to `margin-api` (isolated margin); pass
-     * `source: 'super-margin-api'` for cross margin. Requires credentials.
+     * `mode` selects the margin account and is mapped to the HTX `source` field:
+     * `isolated` → `margin-api`, `cross` → `super-margin-api`. Defaults to
+     * `isolated`. An explicit `params.source` still takes precedence. Requires
+     * credentials.
+     *
+     * @example
+     * ```ts
+     * await client.submitMarginOrder({ accountId, symbol: 'btcusdt', type: 'buy-limit', amount: '0.001', price: '50000' });          // isolated
+     * await client.submitMarginOrder({ accountId, symbol: 'btcusdt', type: 'buy-limit', amount: '0.001', price: '50000' }, 'cross'); // cross
+     * ```
      */
-    async submitMarginOrder(params) {
-        return this.placeOrder(params, 'margin-api');
+    async submitMarginOrder(params, mode = 'isolated') {
+        const source = mode === 'cross' ? 'super-margin-api' : 'margin-api';
+        return this.placeOrder(params, source);
     }
     // --- internals ----------------------------------------------------------
     async placeOrder(params, defaultSource) {
