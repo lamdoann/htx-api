@@ -10,21 +10,40 @@ export declare class HtxApiError extends Error {
     constructor(message: string, code: string | undefined, response: unknown);
 }
 /**
- * Thin wrapper around axios that handles the common HTX response envelope.
+ * Thin wrapper around axios that handles HTX request signing and the common
+ * response envelope.
  *
  * Concrete clients (e.g. {@link RestClient}) extend this and expose typed
- * endpoint methods. Only public GET endpoints are needed for the current scope,
- * so request signing is intentionally omitted.
+ * endpoint methods, while {@link BaseRestClient.publicGet},
+ * {@link BaseRestClient.privateGet} and {@link BaseRestClient.privatePost}
+ * remain available for calling any endpoint directly.
  */
 export declare abstract class BaseRestClient {
     protected readonly baseUrl: string;
+    protected readonly host: string;
     protected readonly logger: Logger;
+    private readonly apiKey?;
+    private readonly apiSecret?;
     private readonly axiosInstance;
     constructor(options?: RestClientOptions, logger?: Logger);
     /**
-     * Perform a public GET request and unwrap the HTX response envelope.
+     * Call a public GET endpoint and unwrap the HTX response envelope.
      * @throws {HtxApiError} when the server reports `status: "error"`.
      */
-    protected get<TData>(endpoint: string, params?: Record<string, unknown>): Promise<HtxRestResponse<TData>>;
+    publicGet<TData>(endpoint: string, params?: Record<string, unknown>): Promise<HtxRestResponse<TData>>;
+    /**
+     * Call a signed (private) GET endpoint. `params` are signed and sent as the
+     * query string.
+     * @throws {HtxApiError} when the server reports `status: "error"`.
+     */
+    privateGet<TData>(endpoint: string, params?: Record<string, unknown>): Promise<HtxRestResponse<TData>>;
+    /**
+     * Call a signed (private) POST endpoint. The auth params are signed into the
+     * query string; `body` is sent as the JSON request body.
+     * @throws {HtxApiError} when the server reports `status: "error"`.
+     */
+    privatePost<TData>(endpoint: string, body?: Record<string, unknown>, params?: Record<string, unknown>): Promise<HtxRestResponse<TData>>;
+    private request;
+    private buildSignedQuery;
 }
 //# sourceMappingURL=BaseRestClient.d.ts.map

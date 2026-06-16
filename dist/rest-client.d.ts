@@ -1,17 +1,24 @@
-import { ExchangeInfo, SymbolInfo } from './types/rest';
+import { ExchangeInfo, SubmitOrderParams, SymbolInfo } from './types/rest';
 import { BaseRestClient } from './util/BaseRestClient';
 /**
- * HTX (Huobi) Spot public REST client.
+ * HTX (Huobi) Spot REST client.
  *
- * Scope is intentionally limited to the public market-metadata endpoints needed
- * today; the {@link BaseRestClient} base is structured so authenticated/private
- * endpoints can be layered on later, following the binance SDK pattern.
+ * Public market metadata works without credentials; order placement and any
+ * other private endpoints require `apiKey`/`apiSecret` in the constructor
+ * options. Structured after the binance SDK so additional endpoints can be added
+ * incrementally.
  *
  * @example
  * ```ts
- * const client = new RestClient();
+ * const client = new RestClient({ apiKey: '...', apiSecret: '...' });
  * const info = await client.fetchExchangeInfo();
- * console.log(info.symbols.length);
+ * const orderId = await client.submitSpotOrder({
+ *   accountId: 123,
+ *   symbol: 'btcusdt',
+ *   type: 'buy-limit',
+ *   amount: '0.001',
+ *   price: '50000',
+ * });
  * ```
  */
 export declare class RestClient extends BaseRestClient {
@@ -26,5 +33,19 @@ export declare class RestClient extends BaseRestClient {
      * Convenience helper: fetch only the symbols that are currently `online`.
      */
     fetchOnlineSymbols(): Promise<SymbolInfo[]>;
+    /**
+     * Place a spot order via `POST /v1/order/orders/place`.
+     *
+     * Requires credentials. Returns the new order id.
+     */
+    submitSpotOrder(params: SubmitOrderParams): Promise<string>;
+    /**
+     * Place a margin order via `POST /v1/order/orders/place`.
+     *
+     * Defaults `source` to `margin-api` (isolated margin); pass
+     * `source: 'super-margin-api'` for cross margin. Requires credentials.
+     */
+    submitMarginOrder(params: SubmitOrderParams): Promise<string>;
+    private placeOrder;
 }
 //# sourceMappingURL=rest-client.d.ts.map

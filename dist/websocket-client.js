@@ -1,176 +1,273 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.WebsocketClient = exports.DEFAULT_WS_URL = void 0;
+exports.WebsocketClient = exports.DEFAULT_ACCOUNT_WS_URL = exports.DEFAULT_WS_URL = void 0;
 exports.tradeTopic = tradeTopic;
+exports.klineTopic = klineTopic;
+exports.ordersChannel = ordersChannel;
 const events_1 = require("events");
-const zlib_1 = require("zlib");
-const ws_1 = __importDefault(require("ws"));
+const auth_1 = require("./util/auth");
 const logger_1 = require("./util/logger");
+const WsConnection_1 = require("./util/WsConnection");
 exports.DEFAULT_WS_URL = 'wss://api.huobi.pro/ws';
-/** Build the trade-detail topic string for a symbol, e.g. `market.btcusdt.trade.detail`. */
+exports.DEFAULT_ACCOUNT_WS_URL = 'wss://api.huobi.pro/ws/v2';
+/** Build the trade-detail topic for a symbol, e.g. `market.btcusdt.trade.detail`. */
 function tradeTopic(symbol) {
     return `market.${symbol.toLowerCase()}.trade.detail`;
 }
+/** Build the kline topic for a symbol, e.g. `market.btcusdt.kline.1min`. */
+function klineTopic(symbol, interval) {
+    return `market.${symbol.toLowerCase()}.kline.${interval}`;
+}
+/** Build the private order channel, e.g. `orders#btcusdt` (or `orders#*`). */
+function ordersChannel(symbol) {
+    return `orders#${symbol.toLowerCase()}`;
+}
 /**
- * HTX (Huobi) Spot market-data WebSocket client, focused on trade streams.
+ * HTX (Huobi) Spot WebSocket client.
  *
- * Handles the three protocol quirks of the HTX `/ws` market endpoint:
- *  1. inbound frames are GZIP-compressed and must be inflated,
- *  2. the server sends `{"ping": <n>}` heartbeats that must be answered with
- *     `{"pong": <n>}`,
- *  3. subscriptions use `{"sub": "<topic>", "id": "<id>"}`.
+ * Manages two underlying sockets, created lazily as needed:
+ *  - **market** (`wss://api.huobi.pro/ws`) — public trade & kline streams.
+ *    Frames are GZIP-compressed; heartbeat is `{"ping":n}` → `{"pong":n}`.
+ *  - **account** (`wss://api.huobi.pro/ws/v2`) — private order updates. Frames
+ *    are plain JSON; heartbeat is `{"action":"ping"}` → `{"action":"pong"}`;
+ *    requires API key/secret auth before subscribing.
+ *
+ * Subscriptions are remembered and replayed on reconnect.
  *
  * @example
  * ```ts
- * const ws = new WebsocketClient();
- * ws.on('trade', (msg) => console.log(msg.tick.data));
- * ws.connect();
+ * const ws = new WebsocketClient({ apiKey: '...', apiSecret: '...' });
+ * ws.on('trade', (m) => console.log(m.tick.data));
+ * ws.on('order', (m) => console.log(m.data));
  * ws.subscribeTrades('btcusdt');
+ * ws.subscribeKlines('btcusdt', '1min');
+ * ws.subscribeOrders('btcusdt');
  * ```
  */
 class WebsocketClient extends events_1.EventEmitter {
     constructor(options = {}, logger = logger_1.DefaultLogger) {
         super();
-        this.ws = null;
-        /** Topics we want subscribed; replayed on reconnect. */
-        this.subscriptions = new Set();
-        this.reconnectTimer = null;
-        this.closedByUser = false;
-        this.wsUrl = options.wsUrl ?? exports.DEFAULT_WS_URL;
-        this.reconnect = options.reconnect ?? true;
-        this.reconnectIntervalMs = options.reconnectIntervalMs ?? 2000;
+        this.marketConn = null;
+        this.accountConn = null;
+        /** Public market topics we want subscribed; replayed on reconnect. */
+        this.marketSubs = new Set();
+        /** Private order channels we want subscribed; replayed after (re)auth. */
+        this.orderSubs = new Set();
+        this.accountAuthenticated = false;
+        this.options = {
+            apiKey: options.apiKey,
+            apiSecret: options.apiSecret,
+            wsUrl: options.wsUrl ?? exports.DEFAULT_WS_URL,
+            accountWsUrl: options.accountWsUrl ?? exports.DEFAULT_ACCOUNT_WS_URL,
+            reconnect: options.reconnect ?? true,
+            reconnectIntervalMs: options.reconnectIntervalMs ?? 2000,
+        };
         this.logger = logger;
     }
-    /** Open the WebSocket connection. */
+    /** Open the public market connection (private connection opens on demand). */
     connect() {
-        if (this.ws &&
-            (this.ws.readyState === ws_1.default.OPEN ||
-                this.ws.readyState === ws_1.default.CONNECTING)) {
-            return;
-        }
-        this.closedByUser = false;
-        this.logger.info(`Connecting to ${this.wsUrl}`);
-        const ws = new ws_1.default(this.wsUrl);
-        this.ws = ws;
-        ws.on('open', () => this.onOpen());
-        ws.on('message', (data) => this.onMessage(data));
-        ws.on('error', (err) => this.emit('error', err));
-        ws.on('close', () => this.onClose());
+        this.ensureMarket().connect();
     }
+    // --- public market subscriptions ----------------------------------------
     /** Subscribe to the trade-detail stream for one or more symbols. */
     subscribeTrades(symbols) {
-        const list = Array.isArray(symbols) ? symbols : [symbols];
-        for (const symbol of list) {
-            const topic = tradeTopic(symbol);
-            this.subscriptions.add(topic);
-            this.sendSub(topic);
-        }
+        this.subscribeMarket(toList(symbols).map(tradeTopic));
     }
     /** Unsubscribe from the trade-detail stream for one or more symbols. */
     unsubscribeTrades(symbols) {
-        const list = Array.isArray(symbols) ? symbols : [symbols];
-        for (const symbol of list) {
-            const topic = tradeTopic(symbol);
-            this.subscriptions.delete(topic);
-            this.send({ unsub: topic, id: topic });
+        this.unsubscribeMarket(toList(symbols).map(tradeTopic));
+    }
+    /** Subscribe to the kline stream for one or more symbols at a given interval. */
+    subscribeKlines(symbols, interval) {
+        this.subscribeMarket(toList(symbols).map((s) => klineTopic(s, interval)));
+    }
+    /** Unsubscribe from the kline stream for one or more symbols. */
+    unsubscribeKlines(symbols, interval) {
+        this.unsubscribeMarket(toList(symbols).map((s) => klineTopic(s, interval)));
+    }
+    // --- private order subscriptions ----------------------------------------
+    /**
+     * Subscribe to private order updates. Pass one or more symbols, or omit to
+     * subscribe to all symbols (`orders#*`). Requires API credentials; the account
+     * connection is opened and authenticated automatically.
+     */
+    subscribeOrders(symbols) {
+        const list = symbols === undefined ? ['*'] : toList(symbols);
+        for (const channel of list.map(ordersChannel)) {
+            this.orderSubs.add(channel);
+            if (this.accountAuthenticated) {
+                this.accountConn?.send({ action: 'sub', ch: channel });
+            }
+        }
+        this.ensureAccount().connect();
+    }
+    /** Unsubscribe from private order updates. */
+    unsubscribeOrders(symbols) {
+        const list = symbols === undefined ? ['*'] : toList(symbols);
+        for (const channel of list.map(ordersChannel)) {
+            this.orderSubs.delete(channel);
+            this.accountConn?.send({ action: 'unsub', ch: channel });
         }
     }
-    /** Close the connection and stop reconnecting. */
+    // --- lifecycle ----------------------------------------------------------
+    /** Gracefully close all connections and stop reconnecting. */
     close() {
-        this.closedByUser = true;
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.ws?.close();
-        this.ws = null;
+        this.marketConn?.close();
+        this.accountConn?.close();
+        this.accountAuthenticated = false;
+    }
+    /** Forcefully terminate all connections immediately and stop reconnecting. */
+    terminate() {
+        this.marketConn?.terminate();
+        this.accountConn?.terminate();
+        this.accountAuthenticated = false;
     }
     // --- internals ----------------------------------------------------------
-    onOpen() {
-        this.logger.info('WebSocket connected');
-        this.emit('open');
-        // Replay any topics requested before/across (re)connects.
-        for (const topic of this.subscriptions) {
-            this.sendSub(topic);
+    subscribeMarket(topics) {
+        const conn = this.ensureMarket();
+        for (const topic of topics) {
+            this.marketSubs.add(topic);
+            conn.send({ sub: topic, id: topic });
+        }
+        conn.connect();
+    }
+    unsubscribeMarket(topics) {
+        for (const topic of topics) {
+            this.marketSubs.delete(topic);
+            this.marketConn?.send({ unsub: topic, id: topic });
         }
     }
-    onClose() {
-        this.logger.info('WebSocket closed');
-        this.emit('close');
-        if (this.reconnect && !this.closedByUser) {
-            this.scheduleReconnect();
+    ensureMarket() {
+        if (!this.marketConn) {
+            this.marketConn = new WsConnection_1.WsConnection({
+                name: 'market',
+                url: this.options.wsUrl,
+                gzip: true,
+                reconnect: this.options.reconnect,
+                reconnectIntervalMs: this.options.reconnectIntervalMs,
+                logger: this.logger,
+                onOpen: () => {
+                    this.emit('open');
+                    for (const topic of this.marketSubs) {
+                        this.marketConn?.send({ sub: topic, id: topic });
+                    }
+                },
+                onMessage: (msg) => this.routeMarket(msg),
+                onError: (err) => this.emit('error', err),
+                onClose: () => this.emit('close'),
+                onReconnecting: () => this.emit('reconnecting'),
+            });
         }
+        return this.marketConn;
     }
-    scheduleReconnect() {
-        if (this.reconnectTimer) {
-            return;
+    ensureAccount() {
+        if (!this.accountConn) {
+            this.accountConn = new WsConnection_1.WsConnection({
+                name: 'account',
+                url: this.options.accountWsUrl,
+                gzip: false,
+                reconnect: this.options.reconnect,
+                reconnectIntervalMs: this.options.reconnectIntervalMs,
+                logger: this.logger,
+                onOpen: () => this.sendAuth(),
+                onMessage: (msg) => this.routeAccount(msg),
+                onError: (err) => this.emit('error', err),
+                onClose: () => {
+                    this.accountAuthenticated = false;
+                    this.emit('close');
+                },
+                onReconnecting: () => this.emit('reconnecting'),
+            });
         }
-        this.emit('reconnecting');
-        this.logger.info(`Reconnecting in ${this.reconnectIntervalMs}ms`);
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.connect();
-        }, this.reconnectIntervalMs);
+        return this.accountConn;
     }
-    onMessage(raw) {
-        let decoded;
-        try {
-            // HTX market frames are gzip-compressed binary.
-            const buffer = this.toBuffer(raw);
-            const text = (0, zlib_1.gunzipSync)(buffer).toString('utf-8');
-            decoded = JSON.parse(text);
-        }
-        catch (err) {
-            this.emit('error', err);
+    routeMarket(message) {
+        this.emit('message', message);
+        if (!isObject(message)) {
             return;
         }
-        this.emit('message', decoded);
-        this.routeMessage(decoded);
-    }
-    routeMessage(message) {
-        if (typeof message !== 'object' || message === null) {
+        // Heartbeat: { "ping": <number> } -> { "pong": <number> }.
+        if (typeof message.ping === 'number') {
+            this.marketConn?.send({ pong: message.ping });
             return;
         }
-        const msg = message;
-        // Heartbeat: { "ping": <number> } -> reply { "pong": <number> }.
-        if (typeof msg.ping === 'number') {
-            this.send({ pong: msg.ping });
-            return;
-        }
-        // Subscribe / unsubscribe acknowledgement.
-        if (typeof msg.subbed === 'string' || typeof msg.unsubbed === 'string') {
+        if (typeof message.subbed === 'string' || typeof message.unsubbed === 'string') {
             this.emit('response', message);
             return;
         }
-        // Data push: { ch: "market.<symbol>.trade.detail", tick: {...} }.
-        if (typeof msg.ch === 'string' &&
-            msg.ch.endsWith('.trade.detail') &&
-            msg.tick) {
-            this.emit('trade', message);
+        const ch = message.ch;
+        if (typeof ch === 'string' && message.tick) {
+            if (ch.endsWith('.trade.detail')) {
+                this.emit('trade', message);
+            }
+            else if (ch.includes('.kline.')) {
+                this.emit('kline', message);
+            }
         }
     }
-    sendSub(topic) {
-        this.send({ sub: topic, id: topic });
-    }
-    send(payload) {
-        if (this.ws?.readyState !== ws_1.default.OPEN) {
-            this.logger.debug('Socket not open; dropping outbound message', payload);
+    routeAccount(message) {
+        this.emit('message', message);
+        if (!isObject(message)) {
             return;
         }
-        this.ws.send(JSON.stringify(payload));
+        const action = message.action;
+        // Heartbeat: { action: "ping", data: { ts } } -> { action: "pong", data: { ts } }.
+        if (action === 'ping') {
+            const data = isObject(message.data) ? message.data : {};
+            this.accountConn?.send({ action: 'pong', data });
+            return;
+        }
+        if (action === 'req' && message.ch === 'auth') {
+            if (message.code === 200) {
+                this.accountAuthenticated = true;
+                this.logger.info('[account] authenticated');
+                this.emit('authenticated');
+                for (const channel of this.orderSubs) {
+                    this.accountConn?.send({ action: 'sub', ch: channel });
+                }
+            }
+            else {
+                this.emit('error', new Error(`WebSocket auth failed (code ${message.code}): ${String(message.message ?? '')}`));
+            }
+            return;
+        }
+        if (action === 'sub' || action === 'unsub') {
+            this.emit('response', {
+                status: message.code === 200 ? 'ok' : 'error',
+                subbed: action === 'sub' ? message.ch : undefined,
+                unsubbed: action === 'unsub' ? message.ch : undefined,
+                ts: Date.now(),
+                'err-code': message.code === 200 ? undefined : String(message.code),
+                'err-msg': message.code === 200 ? undefined : String(message.message ?? ''),
+            });
+            return;
+        }
+        if (action === 'push' &&
+            typeof message.ch === 'string' &&
+            message.ch.startsWith('orders#')) {
+            this.emit('order', message);
+        }
     }
-    toBuffer(raw) {
-        if (Buffer.isBuffer(raw)) {
-            return raw;
+    sendAuth() {
+        if (!this.options.apiKey || !this.options.apiSecret) {
+            this.emit('error', new Error('apiKey and apiSecret are required for private channels.'));
+            return;
         }
-        if (Array.isArray(raw)) {
-            return Buffer.concat(raw);
-        }
-        return Buffer.from(raw);
+        const url = new URL(this.options.accountWsUrl);
+        const params = (0, auth_1.buildWsAuthParams)({
+            host: url.host,
+            path: url.pathname,
+            apiKey: this.options.apiKey,
+            apiSecret: this.options.apiSecret,
+        });
+        this.accountConn?.send({ action: 'req', ch: 'auth', params });
     }
 }
 exports.WebsocketClient = WebsocketClient;
+function toList(symbols) {
+    return Array.isArray(symbols) ? symbols : [symbols];
+}
+function isObject(value) {
+    return typeof value === 'object' && value !== null;
+}
 //# sourceMappingURL=websocket-client.js.map

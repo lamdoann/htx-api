@@ -60,6 +60,53 @@ export interface SymbolInfo {
     [key: string]: unknown;
 }
 /**
+ * HTX order type. Combines the side and the order behaviour, e.g.
+ * `"buy-limit"`, `"sell-market"`, `"buy-limit-maker"`, `"sell-ioc"`.
+ */
+export type OrderType = 'buy-market' | 'sell-market' | 'buy-limit' | 'sell-limit' | 'buy-ioc' | 'sell-ioc' | 'buy-limit-maker' | 'sell-limit-maker' | 'buy-limit-fok' | 'sell-limit-fok' | 'buy-stop-limit' | 'sell-stop-limit' | 'buy-stop-limit-fok' | 'sell-stop-limit-fok';
+/**
+ * Order source / trading account, sent as `source` to the place-order endpoint.
+ *
+ * - `spot-api`         – spot account
+ * - `margin-api`       – isolated margin account
+ * - `super-margin-api` – cross margin account
+ * - `c2c-margin-api`   – C2C margin account
+ */
+export type OrderSource = 'spot-api' | 'margin-api' | 'super-margin-api' | 'c2c-margin-api';
+/**
+ * Parameters for placing an order (`POST /v1/order/orders/place`).
+ *
+ * Friendly camelCase fields; {@link RestClient.submitSpotOrder} maps them to the
+ * kebab-case field names HTX expects.
+ */
+export interface SubmitOrderParams {
+    /** Account id the order is placed from (see `GET /v1/account/accounts`). */
+    accountId: string | number;
+    /** Trading symbol, e.g. `"btcusdt"`. */
+    symbol: string;
+    /** Order type (side + behaviour). */
+    type: OrderType;
+    /**
+     * Order size. For limit/most orders this is the base-currency amount; for
+     * `buy-market` it is the quote-currency total to spend.
+     */
+    amount: string | number;
+    /** Limit price. Required for limit orders, omit for market orders. */
+    price?: string | number;
+    /** Trigger price for stop-limit orders. */
+    stopPrice?: string | number;
+    /** Comparison operator for stop orders. */
+    operator?: 'gte' | 'lte';
+    /** Client-assigned order id (for de-duplication / lookup). */
+    clientOrderId?: string;
+    /**
+     * Order source. Defaults are set by the helper used:
+     * `spot-api` for {@link RestClient.submitSpotOrder}, `margin-api` for
+     * {@link RestClient.submitMarginOrder}.
+     */
+    source?: OrderSource;
+}
+/**
  * Normalised result of {@link RestClient.fetchExchangeInfo}.
  *
  * Mirrors the `exchangeInfo` concept from the binance SDK: a single object that

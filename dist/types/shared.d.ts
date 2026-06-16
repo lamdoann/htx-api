@@ -15,6 +15,14 @@ export interface HtxRestResponse<TData> {
 }
 export interface RestClientOptions {
     /**
+     * API key. Required only for private (signed) endpoints.
+     */
+    apiKey?: string;
+    /**
+     * API secret. Required only for private (signed) endpoints.
+     */
+    apiSecret?: string;
+    /**
      * Override the REST base URL.
      * @default "https://api.huobi.pro"
      */
