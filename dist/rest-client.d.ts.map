@@ -1,0 +1,1 @@
+{"version":3,"file":"rest-client.d.ts","sourceRoot":"","sources":["../src/rest-client.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,YAAY,EAAE,UAAU,EAAE,MAAM,cAAc,CAAC;AACxD,OAAO,EAAE,cAAc,EAAE,MAAM,uBAAuB,CAAC;AAEvD;;;;;;;;;;;;;GAaG;AACH,qBAAa,UAAW,SAAQ,cAAc;IAC5C;;;;;OAKG;IACG,iBAAiB,IAAI,OAAO,CAAC,YAAY,CAAC;IAmBhD;;OAEG;IACG,kBAAkB,IAAI,OAAO,CAAC,UAAU,EAAE,CAAC;CAIlD"}
