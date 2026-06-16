@@ -178,7 +178,12 @@ npm install
 npm run build          # compile to dist/
 npm run example:rest   # run the REST example
 npm run example:ws     # run the WebSocket example
+npm test               # run unit tests (offline, no API keys needed)
 ```
+
+Tests use Node's built-in test runner and cover the request-signing logic
+(`util/auth.ts`) with golden signature vectors — no network or credentials
+required.
 
 ## License
 

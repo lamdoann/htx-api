@@ -14,6 +14,7 @@
     "prepare": "npm run build",
     "prepublishOnly": "npm run clean && npm run build",
     "lint": "tsc --noEmit",
+    "test": "node --require ts-node/register --test test/*.test.ts",
     "example:rest": "ts-node examples/rest-exchange-info.ts",
     "example:ws": "ts-node examples/ws-trades.ts",
     "example:klines": "ts-node examples/ws-klines.ts",
